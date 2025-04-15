@@ -1,18 +1,18 @@
 import os
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+import json
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException,Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 import mysql.connector
 from mysql.connector import Error
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import uuid
-from pathlib import Path
 
 app = FastAPI()
 
@@ -34,7 +34,7 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': '',
+    'password': 'Devita@#2001',
     'database': 'illegal_dumping_db'
 }
 
@@ -59,17 +59,6 @@ class ReportBase(BaseModel):
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
 
-    @validator('date')
-    def validate_date(cls, v):
-        try:
-            datetime.strptime(v, '%Y-%m-%d')
-            return v
-        except ValueError:
-            raise ValueError("Date must be in YYYY-MM-DD format")
-
-class ReportCreate(ReportBase):
-    pass
-
 class ReportResponse(ReportBase):
     id: int
     created_at: datetime
@@ -89,9 +78,6 @@ class MemberBase(BaseModel):
     volunteer_interest: bool = False
     newsletter_consent: bool = True
 
-class MemberCreate(MemberBase):
-    pass
-
 class MemberResponse(MemberBase):
     id: int
     created_at: datetime
@@ -105,9 +91,6 @@ class EventBase(BaseModel):
     organizer: str
     contact: str
     requirements: Optional[str] = None
-
-class EventCreate(EventBase):
-    pass
 
 class EventResponse(EventBase):
     id: int
@@ -247,12 +230,43 @@ def send_email(to_email: str, subject: str, body: str):
         print(f"Error sending email: {e}")
 
 # API Endpoints
+
+@app.patch("/reports/{report_id}/status/")
+async def update_report_status(
+    report_id: int,
+    status_update: dict = Body(...)
+):
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        new_status = status_update.get('status')
+        if not new_status:
+            raise HTTPException(status_code=400, detail="Status is required")
+
+        valid_statuses = ['pending', 'in progress', 'completed', 'rejected']
+        if new_status.lower() not in valid_statuses:
+            raise HTTPException(status_code=400, detail="Invalid status value")
+
+        query = "UPDATE reports SET status = %s WHERE id = %s"
+        cursor.execute(query, (new_status.lower(), report_id))
+        connection.commit()
+
+        return {"message": "Status updated successfully"}
+    except Error as e:
+        connection.rollback()
+        print(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
 @app.post("/reports/", response_model=ReportResponse)
 async def create_report(
     location: str = Form(...),
     city: str = Form(...),
     state: str = Form(...),
-    waste_type: str = Form(...),  # JSON string
+    waste_type: str = Form(...),
     size: str = Form(...),
     date: str = Form(...),
     time: str = Form(...),
@@ -266,11 +280,22 @@ async def create_report(
     files: List[UploadFile] = File([])
 ):
     try:
-        # Parse waste_type from JSON string
-        import json
-        waste_types = json.loads(waste_type)
-        if not isinstance(waste_types, list):
-            raise HTTPException(status_code=400, detail="waste_type must be a JSON array")
+        # Validate and parse date
+        try:
+            date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid date format. Please use YYYY-MM-DD"
+            )
+
+        # Parse waste_type - handle both JSON array and comma-separated string
+        try:
+            waste_types = json.loads(waste_type)
+            if not isinstance(waste_types, list):
+                waste_types = [waste_types]
+        except json.JSONDecodeError:
+            waste_types = [wt.strip() for wt in waste_type.split(",") if wt.strip()]
 
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
@@ -283,7 +308,7 @@ async def create_report(
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         values = (
-            location, city, state, json.dumps(waste_types), size, date, time,
+            location, city, state, json.dumps(waste_types), size, date_obj, time,
             description, video_link, anonymous, first_name, last_name, email, phone
         )
         cursor.execute(query, values)
@@ -296,7 +321,6 @@ async def create_report(
                 filename = save_uploaded_file(file)
                 photo_paths.append(filename)
                 
-                # Insert photo record
                 cursor.execute(
                     "INSERT INTO report_photos (report_id, photo_path) VALUES (%s, %s)",
                     (report_id, filename)
@@ -308,12 +332,11 @@ async def create_report(
         cursor.execute("SELECT * FROM reports WHERE id = %s", (report_id,))
         report = cursor.fetchone()
         
-        # Convert date to string for response
         report['date'] = report['date'].strftime('%Y-%m-%d')
         report['waste_type'] = json.loads(report['waste_type'])
         report['photos'] = photo_paths
 
-        # Send confirmation email if not anonymous and email provided
+        # Send confirmation email
         if not anonymous and email:
             subject = "Your Illegal Dumping Report Has Been Received"
             body = f"""Hello {first_name or 'there'},
@@ -325,7 +348,7 @@ Date Observed: {date}
 Type of Waste: {', '.join(waste_types)}
 Size: {size}
 
-We will review your report and take appropriate action. You may receive follow-up questions from local authorities.
+We will review your report and take appropriate action.
 
 Thank you for helping keep our community clean!
 
@@ -339,6 +362,8 @@ The Illegal Dumping Prevention Team
         connection.rollback()
         print(f"Database error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error creating report: {e}")
         raise HTTPException(status_code=500, detail="Error creating report")
@@ -353,17 +378,14 @@ async def get_report(report_id: int):
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # Get report
         cursor.execute("SELECT * FROM reports WHERE id = %s", (report_id,))
         report = cursor.fetchone()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
 
-        # Get photos
         cursor.execute("SELECT photo_path FROM report_photos WHERE report_id = %s", (report_id,))
         photos = [row['photo_path'] for row in cursor.fetchall()]
 
-        # Convert date and waste_type
         report['date'] = report['date'].strftime('%Y-%m-%d')
         report['waste_type'] = json.loads(report['waste_type'])
         report['photos'] = photos
@@ -378,7 +400,19 @@ async def get_report(report_id: int):
             connection.close()
 
 @app.post("/members/", response_model=MemberResponse)
-async def create_member(member: MemberCreate):
+async def create_member(
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(None),
+    street: str = Form(None),
+    city: str = Form(None),
+    state: str = Form(None),
+    zip_code: str = Form(None),
+    membership_level: str = Form("basic"),
+    volunteer_interest: bool = Form(False),
+    newsletter_consent: bool = Form(True)
+):
     try:
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
@@ -390,41 +424,39 @@ async def create_member(member: MemberCreate):
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         values = (
-            member.first_name, member.last_name, member.email, member.phone,
-            member.street, member.city, member.state, member.zip_code,
-            member.membership_level, member.volunteer_interest, member.newsletter_consent
+            first_name, last_name, email, phone, street, city, state, zip_code,
+            membership_level, volunteer_interest, newsletter_consent
         )
         cursor.execute(query, values)
         member_id = cursor.lastrowid
 
         connection.commit()
 
-        # Get the created member
         cursor.execute("SELECT * FROM members WHERE id = %s", (member_id,))
         member_data = cursor.fetchone()
 
         # Send welcome email
         subject = "Welcome to Our Community!"
-        body = f"""Hello {member.first_name},
+        body = f"""Hello {first_name},
 
-Thank you for joining our community as a {member.membership_level} member. 
+Thank you for joining our community as a {membership_level} member. 
 
-Together we can make a difference in preventing illegal dumping and keeping our environment clean.
+Together we can make a difference in preventing illegal dumping.
 
 """
-        if member.membership_level != "basic":
-            body += f"\nAs a {member.membership_level} member, you'll receive additional benefits and updates.\n"
+        if membership_level != "basic":
+            body += f"\nAs a {membership_level} member, you'll receive additional benefits.\n"
 
         body += """
 Sincerely,
 The Illegal Dumping Prevention Team
 """
-        send_email(member.email, subject, body)
+        send_email(email, subject, body)
 
         return member_data
     except Error as e:
         connection.rollback()
-        if e.errno == 1062:  # Duplicate entry
+        if e.errno == 1062:
             raise HTTPException(status_code=400, detail="Email already registered")
         print(f"Database error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
@@ -467,7 +499,13 @@ async def create_event(
 ):
     try:
         # Validate date
-        datetime.strptime(date, '%Y-%m-%d')
+        try:
+            date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid date format. Please use YYYY-MM-DD"
+            )
 
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
@@ -485,7 +523,7 @@ async def create_event(
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         values = (
-            title, description, location, date, time, image_path,
+            title, description, location, date_obj, time, image_path,
             organizer, contact, requirements
         )
         cursor.execute(query, values)
@@ -493,23 +531,22 @@ async def create_event(
 
         connection.commit()
 
-        # Get the created event
         cursor.execute("SELECT * FROM events WHERE id = %s", (event_id,))
         event = cursor.fetchone()
         event['date'] = event['date'].strftime('%Y-%m-%d')
 
         return event
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Date must be in YYYY-MM-DD format")
     except Error as e:
         connection.rollback()
         print(f"Database error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error creating event: {e}")
         raise HTTPException(status_code=500, detail="Error creating event")
     finally:
-        if 'connection' in locals() and connection.is_connected():
+        if connection.is_connected():
             cursor.close()
             connection.close()
 
@@ -543,10 +580,8 @@ async def join_event(event_id: int, member_id: Optional[int] = None, email: Opti
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)
 
-        # Update participant count
         cursor.execute("UPDATE events SET participants = participants + 1 WHERE id = %s", (event_id,))
         
-        # Get event details
         cursor.execute("SELECT * FROM events WHERE id = %s", (event_id,))
         event = cursor.fetchone()
         if not event:
@@ -554,7 +589,6 @@ async def join_event(event_id: int, member_id: Optional[int] = None, email: Opti
 
         connection.commit()
 
-        # Send confirmation email if email provided
         if email:
             subject = f"Event Registration Confirmation: {event['title']}"
             body = f"""Thank you for registering for:
@@ -564,24 +598,123 @@ Date: {event['date'].strftime('%Y-%m-%d')}
 Time: {event['time']}
 Location: {event['location']}
 
-Event Details:
+Details:
 {event['description']}
-
 """
             if event['requirements']:
                 body += f"\nRequirements: {event['requirements']}\n"
 
-            body += """
-We look forward to seeing you there!
-
-Sincerely,
-The Event Organizers
-"""
+            body += "\nWe look forward to seeing you there!"
             send_email(email, subject, body)
 
         return {"message": "Successfully joined event", "event_id": event_id}
     except Error as e:
         connection.rollback()
+        print(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+@app.get("/reports/")
+async def get_all_reports(
+    page: int = 1,
+    limit: int = 10,
+    status: Optional[str] = None,
+    state: Optional[str] = None,
+    city: Optional[str] = None
+):
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Base query
+        query = "SELECT * FROM reports"
+        count_query = "SELECT COUNT(*) as total FROM reports"
+        conditions = []
+        params = []
+
+        # Add filters if provided
+        if status:
+            conditions.append("status = %s")
+            params.append(status)
+        if state:
+            conditions.append("state = %s")
+            params.append(state)
+        if city:
+            conditions.append("city = %s")
+            params.append(city)
+
+        # Add WHERE clause if there are conditions
+        if conditions:
+            where_clause = " WHERE " + " AND ".join(conditions)
+            query += where_clause
+            count_query += where_clause
+
+        # Add pagination
+        offset = (page - 1) * limit
+        query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+
+        # Get total count
+        cursor.execute(count_query, params[:-2])  # Exclude limit/offset params
+        total = cursor.fetchone()['total']
+
+        # Get paginated results
+        cursor.execute(query, params)
+        reports = cursor.fetchall()
+
+        # Convert waste_type from JSON string to list
+        for report in reports:
+            report['waste_type'] = json.loads(report['waste_type'])
+            
+            # Get photos for each report
+            cursor.execute(
+                "SELECT photo_path FROM report_photos WHERE report_id = %s",
+                (report['id'],)  # Fixed: Added missing closing parenthesis
+            )
+            report['photos'] = [row['photo_path'] for row in cursor.fetchall()]
+
+        return {
+            "data": reports,
+            "pagination": {
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "total_pages": (total + limit - 1) // limit
+            }
+        }
+    except Error as e:
+        print(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+@app.get("/reports/stats/")
+async def get_report_stats():
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        # Get total reports count
+        cursor.execute("SELECT COUNT(*) as total FROM reports")
+        total_reports = cursor.fetchone()['total']
+
+        # Get pending reports count
+        cursor.execute("SELECT COUNT(*) as pending FROM reports WHERE status = 'pending'")
+        pending_reports = cursor.fetchone()['pending']
+
+        # Get active volunteers count (members with volunteer interest)
+        cursor.execute("SELECT COUNT(*) as volunteers FROM members WHERE volunteer_interest = TRUE")
+        active_volunteers = cursor.fetchone()['volunteers']
+
+        return {
+            "pendingReports": pending_reports,
+            "totalReports": total_reports,
+            "activeVolunteers": active_volunteers
+        }
+    except Error as e:
         print(f"Database error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
     finally:
@@ -594,7 +727,6 @@ The Event Organizers
 async def root():
     return {"message": "Illegal Dumping Reporting System API"}
 
-# Run the app (for development)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
